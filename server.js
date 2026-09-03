@@ -1032,8 +1032,12 @@ app.post("/api/chat", async (req, res) => {
 
     try {
       const [rows] = await pool.execute(
-        "SELECT role, content FROM chat WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        [req.userId, MAX_CHAT_HISTORY]
+        // NOTE: MySQL/TiDB's prepared-statement protocol does not allow a
+        // bound parameter for LIMIT — it must be a literal in the SQL text.
+        // MAX_CHAT_HISTORY is a fixed server-side constant (never user input),
+        // so inlining it here is safe.
+        `SELECT role, content FROM chat WHERE user_id = ? ORDER BY id DESC LIMIT ${Number(MAX_CHAT_HISTORY)}`,
+        [req.userId]
       );
       const history = rows.reverse().map((r) => ({ role: r.role, content: r.content }));
       const financialContext = await buildFinancialContext(req.userId);
