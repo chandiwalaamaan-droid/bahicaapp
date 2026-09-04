@@ -754,7 +754,9 @@ async function getAIReply(systemPrompt, history) {
   const errors = [];
   for (const { label, call } of attempts) {
     try {
-      return await withTimeout((signal) => call(systemPrompt, history, signal), PROVIDER_TIMEOUT);
+      const reply = await withTimeout((signal) => call(systemPrompt, history, signal), PROVIDER_TIMEOUT);
+      console.log(`AI provider (${label}) answered`);
+      return reply;
     } catch (err) {
       console.error(`AI provider (${label}) failed:`, err.message);
       errors.push(`${label}: ${err.message}`);
