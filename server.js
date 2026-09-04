@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 import crypto from "crypto";
+import { OAuth2Client } from "google-auth-library";
 
 const app = express();
 
@@ -39,6 +40,16 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
+// ---------- Google Sign-In ----------
+// Same OAuth 2.0 Client ID (Web application type) must be set on the frontend
+// as VITE_GOOGLE_CLIENT_ID. Without it, "Continue with Google" is simply not
+// offered — email/password auth keeps working either way.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+if (!GOOGLE_CLIENT_ID) {
+  console.warn("GOOGLE_CLIENT_ID not set — Google sign-in is disabled, email/password auth still works.");
+}
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
+
 // ---------- TiDB connection ----------
 if (!process.env.TIDB_HOST || !process.env.TIDB_USER || !process.env.TIDB_DATABASE) {
   console.error(
@@ -66,8 +77,9 @@ async function initSchema() {
     CREATE TABLE IF NOT EXISTS users (
       id VARCHAR(36) PRIMARY KEY,
       email VARCHAR(255) NOT NULL UNIQUE,
-      password_hash VARCHAR(255) NOT NULL,
+      password_hash VARCHAR(255),
       name VARCHAR(255),
+      google_id VARCHAR(255) UNIQUE,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -172,6 +184,10 @@ async function initSchema() {
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS client_address TEXT",
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS due_date VARCHAR(10)",
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'unpaid'",
+    // Google sign-in: existing accounts keep their password; new Google-only
+    // accounts have no password, so the column can no longer be NOT NULL.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255) UNIQUE",
+    "ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) NULL",
   ];
   for (const sql of migrations) {
     try {
@@ -280,6 +296,8 @@ const chatSchema = z.object({
   message: z.string().trim().min(1).max(4000),
 });
 
+const googleAuthSchema = z.object({ credential: z.string().trim().min(20) });
+
 const forgotPasswordSchema = z.object({ email: emailSchema });
 const resetPasswordSchema = z.object({
   token: z.string().trim().min(20).max(200),
@@ -355,6 +373,9 @@ app.post("/api/auth/login", async (req, res) => {
     const row = rows[0];
     // Constant-ish response either way to avoid trivially confirming which emails exist.
     if (!row) return res.status(401).json({ error: "Invalid email or password" });
+    if (!row.password_hash) {
+      return res.status(401).json({ error: "This account uses Google sign-in. Continue with Google instead." });
+    }
     const ok = await bcrypt.compare(body.password, row.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid email or password" });
     const user = { id: row.id, email: row.email, name: row.name };
@@ -362,6 +383,48 @@ app.post("/api/auth/login", async (req, res) => {
   } catch (err) {
     console.error("POST /api/auth/login failed:", err.message);
     res.status(500).json({ error: "Login failed" });
+  }
+});
+
+app.post("/api/auth/google", async (req, res) => {
+  if (!googleClient) return res.status(503).json({ error: "Google sign-in is not configured on this server" });
+  const body = validate(googleAuthSchema, req.body, res);
+  if (!body) return;
+  try {
+    const ticket = await googleClient.verifyIdToken({ idToken: body.credential, audience: GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    if (!payload?.email) return res.status(401).json({ error: "Google did not return an email address" });
+    if (!payload.email_verified) {
+      return res.status(401).json({ error: "Your Google email isn't verified" });
+    }
+    const email = payload.email.toLowerCase();
+    const googleId = payload.sub;
+    const name = payload.name || null;
+
+    const [byGoogleId] = await pool.execute("SELECT * FROM users WHERE google_id = ?", [googleId]);
+    let row = byGoogleId[0];
+
+    if (!row) {
+      const [byEmail] = await pool.execute("SELECT * FROM users WHERE email = ?", [email]);
+      row = byEmail[0];
+      if (row) {
+        // Existing password-based account signing in with Google for the first time — link it.
+        await pool.execute("UPDATE users SET google_id = ? WHERE id = ?", [googleId, row.id]);
+      } else {
+        const id = crypto.randomUUID();
+        await pool.execute(
+          "INSERT INTO users (id, email, password_hash, name, google_id) VALUES (?, ?, NULL, ?, ?)",
+          [id, email, name, googleId]
+        );
+        row = { id, email, name };
+      }
+    }
+
+    const user = { id: row.id, email: row.email, name: row.name };
+    res.json({ token: signToken(user), user });
+  } catch (err) {
+    console.error("POST /api/auth/google failed:", err.message);
+    res.status(401).json({ error: "Google sign-in failed. Please try again." });
   }
 });
 
@@ -486,7 +549,7 @@ app.put("/api/business-profile", async (req, res) => {
 const SYSTEM_PROMPT_BASE =
   "You are the AI Advisor inside 'Bahi', a personal accounting web app for Indian users (accessed at whatever URL the user visits it at — you don't know a fixed domain, so never invent one like 'bahi.in'). The app has exactly these sections, shown as tabs in the sidebar: Dashboard (income/expense/GST summary), Transactions (log income and expenses by category), Invoices (create GST invoices, mark paid/unpaid, issue credit/debit notes), Tax Calculator (income tax estimate), GST Calculator, AI Advisor (this chat), and Business Profile (name, GSTIN, PAN, address). There is no separate login domain, no 'magic link' sign-in, no Chart of Accounts, no Planner/recurring transactions, and no separate Reports section — do not describe features that aren't in this list, even if they sound plausible for an accounting app. If asked how to do something in the app, only describe these real tabs and actions. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (FY 2025-26: new regime default, slabs 0-4L nil/4-8L 5%/8-12L 10%/12-16L 15%/16-20L 20%/20-24L 25%/>24L 30%, 87A rebate up to 12L taxable income; old regime slabs 0-2.5L nil/2.5-5L 5%/5-10L 20%/>10L 30%). Be concise, practical, and use ₹ figures where relevant. Always make clear you are an AI assistant, not a licensed Chartered Accountant, and that the person should confirm anything consequential (filings, large transactions, notices from the tax department) with a qualified CA before acting. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.";
 
-const PROVIDER_TIMEOUT = 8000;
+const PROVIDER_TIMEOUT = 15000;
 
 async function withTimeout(fn, ms) {
   const controller = new AbortController();
@@ -498,7 +561,13 @@ async function withTimeout(fn, ms) {
   }
 }
 
-async function callGemini(systemPrompt, history, signal, apiKey) {
+// Defaults match what Bahi shipped with; override on Render (or any host) via
+// env vars without touching code any time a provider ships a new model.
+const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b";
+const DEFAULT_CLOUDFLARE_MODEL = "@cf/zai-org/glm-4.7-flash";
+
+async function callGemini(systemPrompt, history, signal, apiKey, model) {
   if (!apiKey) throw new Error("missing GOOGLE_API_KEY");
 
   const contents = history.map((m) => ({
@@ -507,14 +576,20 @@ async function callGemini(systemPrompt, history, signal, apiKey) {
   }));
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents,
         systemInstruction: { parts: [{ text: systemPrompt }] },
-        generationConfig: { maxOutputTokens: 1000 },
+        generationConfig: {
+          maxOutputTokens: 1000,
+          // Gemini 3.x models default to MEDIUM "thinking" effort, which adds
+          // meaningful latency. LOW is Google's own recommendation for
+          // latency-sensitive chat use cases like this one.
+          thinkingConfig: { thinkingLevel: "LOW" },
+        },
       }),
       signal,
     }
@@ -522,7 +597,7 @@ async function callGemini(systemPrompt, history, signal, apiKey) {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Gemini ${res.status}: ${text}`);
+    throw new Error(`Gemini (${model}) ${res.status}: ${text}`);
   }
 
   const data = await res.json();
@@ -531,7 +606,7 @@ async function callGemini(systemPrompt, history, signal, apiKey) {
   return text;
 }
 
-async function callGroq(systemPrompt, history, signal, apiKey) {
+async function callGroq(systemPrompt, history, signal, apiKey, model) {
   if (!apiKey) throw new Error("missing GROQ_API_KEY");
 
   const messages = [
@@ -546,7 +621,7 @@ async function callGroq(systemPrompt, history, signal, apiKey) {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: "openai/gpt-oss-120b",
+      model,
       max_tokens: 1000,
       messages,
     }),
@@ -555,7 +630,7 @@ async function callGroq(systemPrompt, history, signal, apiKey) {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Groq ${res.status}: ${text}`);
+    throw new Error(`Groq (${model}) ${res.status}: ${text}`);
   }
 
   const data = await res.json();
@@ -564,7 +639,7 @@ async function callGroq(systemPrompt, history, signal, apiKey) {
   return text;
 }
 
-async function callCloudflare(systemPrompt, history, signal, accountId, apiToken) {
+async function callCloudflare(systemPrompt, history, signal, accountId, apiToken, model) {
   if (!accountId || !apiToken) throw new Error("missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN");
 
   const promptLines = [`System: ${systemPrompt}`];
@@ -574,7 +649,7 @@ async function callCloudflare(systemPrompt, history, signal, accountId, apiToken
   promptLines.push("Assistant:");
 
   const res = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/@cf/zai-org/glm-4.7-flash`,
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model}`,
     {
       method: "POST",
       headers: {
@@ -591,7 +666,7 @@ async function callCloudflare(systemPrompt, history, signal, accountId, apiToken
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Cloudflare ${res.status}: ${text}`);
+    throw new Error(`Cloudflare (${model}) ${res.status}: ${text}`);
   }
 
   const data = await res.json();
@@ -604,22 +679,33 @@ async function callCloudflare(systemPrompt, history, signal, accountId, apiToken
 // GOOGLE_API_KEY_2). We try every key for a provider before moving to the next
 // provider, so the order is: gemini key1 -> gemini key2 -> groq key1 -> groq key2 ->
 // cloudflare key1 -> cloudflare key2.
+//
+// Models are read from env vars so you can switch a provider's model on Render
+// (or any host) without touching code or redeploying from source:
+//   GEMINI_MODEL              (both gemini keys, unless overridden per-key below)
+//   GEMINI_MODEL_2            (overrides GEMINI_MODEL for the #2 key only)
+//   GROQ_MODEL / GROQ_MODEL_2
+//   CLOUDFLARE_MODEL / CLOUDFLARE_MODEL_2
+// Any unset var falls back to the DEFAULT_*_MODEL constant above.
 function buildProviderAttempts() {
   const attempts = [];
 
   const geminiKeys = [process.env.GOOGLE_API_KEY, process.env.GOOGLE_API_KEY_2].filter(Boolean);
   for (const [i, apiKey] of geminiKeys.entries()) {
+    const model =
+      (i === 1 && process.env.GEMINI_MODEL_2) || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
     attempts.push({
-      label: `gemini${i > 0 ? `#${i + 1}` : ""}`,
-      call: (systemPrompt, history, signal) => callGemini(systemPrompt, history, signal, apiKey),
+      label: `gemini${i > 0 ? `#${i + 1}` : ""} (${model})`,
+      call: (systemPrompt, history, signal) => callGemini(systemPrompt, history, signal, apiKey, model),
     });
   }
 
   const groqKeys = [process.env.GROQ_API_KEY, process.env.GROQ_API_KEY_2].filter(Boolean);
   for (const [i, apiKey] of groqKeys.entries()) {
+    const model = (i === 1 && process.env.GROQ_MODEL_2) || process.env.GROQ_MODEL || DEFAULT_GROQ_MODEL;
     attempts.push({
-      label: `groq${i > 0 ? `#${i + 1}` : ""}`,
-      call: (systemPrompt, history, signal) => callGroq(systemPrompt, history, signal, apiKey),
+      label: `groq${i > 0 ? `#${i + 1}` : ""} (${model})`,
+      call: (systemPrompt, history, signal) => callGroq(systemPrompt, history, signal, apiKey, model),
     });
   }
 
@@ -630,9 +716,11 @@ function buildProviderAttempts() {
     [process.env.CLOUDFLARE_ACCOUNT_ID_2 || process.env.CLOUDFLARE_ACCOUNT_ID, process.env.CLOUDFLARE_API_TOKEN_2],
   ].filter(([accountId, apiToken]) => accountId && apiToken);
   for (const [i, [accountId, apiToken]] of cloudflarePairs.entries()) {
+    const model =
+      (i === 1 && process.env.CLOUDFLARE_MODEL_2) || process.env.CLOUDFLARE_MODEL || DEFAULT_CLOUDFLARE_MODEL;
     attempts.push({
-      label: `cloudflare${i > 0 ? `#${i + 1}` : ""}`,
-      call: (systemPrompt, history, signal) => callCloudflare(systemPrompt, history, signal, accountId, apiToken),
+      label: `cloudflare${i > 0 ? `#${i + 1}` : ""} (${model})`,
+      call: (systemPrompt, history, signal) => callCloudflare(systemPrompt, history, signal, accountId, apiToken, model),
     });
   }
 
@@ -673,10 +761,19 @@ Respond with ONLY a JSON object, no markdown, no explanation, in exactly this sh
 
 If the amount is genuinely unclear, set "amount" to 0. Today's date is ${new Date().toISOString().slice(0, 10)}.`;
 
-  const raw = await getAIReply(
-    "You are a precise data-extraction tool. You only output valid JSON, nothing else.",
-    [{ role: "user", content: prompt }]
-  );
+  let raw;
+  try {
+    raw = await getAIReply(
+      "You are a precise data-extraction tool. You only output valid JSON, nothing else.",
+      [{ role: "user", content: prompt }]
+    );
+  } catch (err) {
+    console.error("Quick-add AI error:", err);
+    if (err.message && err.message.includes("no provider API keys are configured")) {
+      throw new Error("Quick add isn't available — no AI provider is configured on this server. Use the form below instead.");
+    }
+    throw new Error("Quick add couldn't reach the AI provider just now — please try again shortly, or use the form below instead.");
+  }
 
   const cleaned = raw.replace(/```json|```/g, "").trim();
   let parsed;
@@ -1153,7 +1250,15 @@ async function generateAssistantReply(userId, history) {
     return await getAIReply(systemPrompt, history);
   } catch (err) {
     console.error("AI fallback error:", err);
-    return "The AI Advisor is temporarily unavailable. This can happen if all providers are busy or keys are missing. Please try again shortly.";
+    // Distinguish "nobody configured any AI provider keys" (a setup problem,
+    // permanent until an admin fixes it) from "providers were reachable but
+    // all failed this one time" (transient — retrying may well work). Telling
+    // a user to "try again shortly" when it's actually the former just wastes
+    // their time, since retrying can never succeed until keys are added.
+    if (err.message && err.message.includes("no provider API keys are configured")) {
+      return "The AI Advisor isn't set up yet on this server — no AI provider API keys have been configured. This is a one-time setup step for whoever runs this Bahi instance, not something you can fix from here. Everything else in the app (Transactions, Invoices, calculators) works normally without it.";
+    }
+    return "The AI Advisor couldn't get a response from any AI provider just now. This is usually temporary — please try again in a minute. If it keeps happening, the configured provider keys may have expired or hit a quota limit.";
   }
 }
 
