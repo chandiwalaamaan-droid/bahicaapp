@@ -153,6 +153,18 @@ async function initSchema() {
       next_number INT NOT NULL DEFAULT 1
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id VARCHAR(64) PRIMARY KEY,
+      user_id VARCHAR(36) NOT NULL,
+      token_hash VARCHAR(64) NOT NULL,
+      expires_at DATETIME NOT NULL,
+      used_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_reset_user (user_id),
+      INDEX idx_reset_token (token_hash)
+    )
+  `);
 
   // Safe no-op if columns already exist (idempotent for pre-existing deployments).
   const migrations = [
@@ -268,6 +280,12 @@ const chatSchema = z.object({
   message: z.string().trim().min(1).max(4000),
 });
 
+const forgotPasswordSchema = z.object({ email: emailSchema });
+const resetPasswordSchema = z.object({
+  token: z.string().trim().min(20).max(200),
+  password: passwordSchema,
+});
+
 function validate(schema, data, res) {
   const result = schema.safeParse(data);
   if (!result.success) {
@@ -275,6 +293,36 @@ function validate(schema, data, res) {
     return null;
   }
   return result.data;
+}
+
+// ---------- Password reset email ----------
+// Uses Resend (resend.com) — free tier, one API key, same pattern as the AI
+// provider keys. Without RESEND_API_KEY set, reset links are just logged to
+// the server console so local/dev testing still works without an email account.
+async function sendResetEmail(toEmail, resetLink) {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    console.log(`[dev] Password reset link for ${toEmail}: ${resetLink}`);
+    return;
+  }
+  const from = process.env.RESEND_FROM_EMAIL || "Bahi <onboarding@resend.dev>";
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from,
+      to: [toEmail],
+      subject: "Reset your Bahi password",
+      html: `<p>We received a request to reset your Bahi password.</p><p><a href="${resetLink}">Click here to choose a new password</a></p><p>This link expires in 30 minutes. If you didn't request this, you can safely ignore this email.</p>`,
+    }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Resend API error ${resp.status}: ${text}`);
+  }
 }
 
 // ---------- Auth routes ----------
@@ -314,6 +362,64 @@ app.post("/api/auth/login", async (req, res) => {
   } catch (err) {
     console.error("POST /api/auth/login failed:", err.message);
     res.status(500).json({ error: "Login failed" });
+  }
+});
+
+app.post("/api/auth/forgot-password", async (req, res) => {
+  const body = validate(forgotPasswordSchema, req.body, res);
+  if (!body) return;
+  try {
+    const [rows] = await pool.execute("SELECT id, email FROM users WHERE email = ?", [body.email]);
+    const user = rows[0];
+    // Only act if the account exists, but ALWAYS send back the same response below —
+    // this stops the endpoint being used to check which emails have an account.
+    if (user) {
+      const rawToken = crypto.randomBytes(32).toString("hex");
+      const tokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 minutes
+      await pool.execute(
+        "INSERT INTO password_resets (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+        [crypto.randomUUID(), user.id, tokenHash, expiresAt]
+      );
+      const frontendOrigin = allowedOrigins[0] || "http://localhost:5173";
+      const resetLink = `${frontendOrigin}/?resetToken=${rawToken}`;
+      try {
+        await sendResetEmail(user.email, resetLink);
+      } catch (err) {
+        console.error("Failed to send reset email:", err.message);
+      }
+    }
+    res.json({ message: "If that email is registered, we've sent a password reset link." });
+  } catch (err) {
+    console.error("POST /api/auth/forgot-password failed:", err.message);
+    res.status(500).json({ error: "Could not process request" });
+  }
+});
+
+app.post("/api/auth/reset-password", async (req, res) => {
+  const body = validate(resetPasswordSchema, req.body, res);
+  if (!body) return;
+  try {
+    const tokenHash = crypto.createHash("sha256").update(body.token).digest("hex");
+    const [rows] = await pool.execute(
+      "SELECT * FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW()",
+      [tokenHash]
+    );
+    const reset = rows[0];
+    if (!reset) {
+      return res.status(400).json({ error: "This reset link is invalid or has expired. Request a new one." });
+    }
+
+    const password_hash = await bcrypt.hash(body.password, 10);
+    await pool.execute("UPDATE users SET password_hash = ? WHERE id = ?", [password_hash, reset.user_id]);
+    // Invalidate this and any other outstanding reset tokens for this user.
+    await pool.execute("UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL", [
+      reset.user_id,
+    ]);
+    res.json({ message: "Password updated. You can now sign in." });
+  } catch (err) {
+    console.error("POST /api/auth/reset-password failed:", err.message);
+    res.status(500).json({ error: "Could not reset password" });
   }
 });
 
@@ -378,7 +484,7 @@ app.put("/api/business-profile", async (req, res) => {
 
 // ---------- AI providers ----------
 const SYSTEM_PROMPT_BASE =
-  "You are the AI Advisor inside 'Bahi', a personal accounting app for Indian users. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (FY 2025-26: new regime default, slabs 0-4L nil/4-8L 5%/8-12L 10%/12-16L 15%/16-20L 20%/20-24L 25%/>24L 30%, 87A rebate up to 12L taxable income; old regime slabs 0-2.5L nil/2.5-5L 5%/5-10L 20%/>10L 30%). Be concise, practical, and use ₹ figures where relevant. Always make clear you are an AI assistant, not a licensed Chartered Accountant, and that the person should confirm anything consequential (filings, large transactions, notices from the tax department) with a qualified CA before acting. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.";
+  "You are the AI Advisor inside 'Bahi', a personal accounting web app for Indian users (accessed at whatever URL the user visits it at — you don't know a fixed domain, so never invent one like 'bahi.in'). The app has exactly these sections, shown as tabs in the sidebar: Dashboard (income/expense/GST summary), Transactions (log income and expenses by category), Invoices (create GST invoices, mark paid/unpaid, issue credit/debit notes), Tax Calculator (income tax estimate), GST Calculator, AI Advisor (this chat), and Business Profile (name, GSTIN, PAN, address). There is no separate login domain, no 'magic link' sign-in, no Chart of Accounts, no Planner/recurring transactions, and no separate Reports section — do not describe features that aren't in this list, even if they sound plausible for an accounting app. If asked how to do something in the app, only describe these real tabs and actions. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (FY 2025-26: new regime default, slabs 0-4L nil/4-8L 5%/8-12L 10%/12-16L 15%/16-20L 20%/20-24L 25%/>24L 30%, 87A rebate up to 12L taxable income; old regime slabs 0-2.5L nil/2.5-5L 5%/5-10L 20%/>10L 30%). Be concise, practical, and use ₹ figures where relevant. Always make clear you are an AI assistant, not a licensed Chartered Accountant, and that the person should confirm anything consequential (filings, large transactions, notices from the tax department) with a qualified CA before acting. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.";
 
 const PROVIDER_TIMEOUT = 8000;
 
@@ -401,7 +507,7 @@ async function callGemini(systemPrompt, history, signal, apiKey) {
   }));
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1007,7 +1113,7 @@ app.delete("/api/invoice-notes/:id", async (req, res) => {
 app.get("/api/chat", async (req, res) => {
   try {
     const [rows] = await pool.execute(
-      "SELECT role, content FROM chat WHERE user_id = ? ORDER BY id ASC",
+      "SELECT id, role, content FROM chat WHERE user_id = ? ORDER BY id ASC",
       [req.userId]
     );
     res.json(rows);
@@ -1018,6 +1124,47 @@ app.get("/api/chat", async (req, res) => {
 });
 
 const MAX_CHAT_HISTORY = 20; // cap how much prior chat we resend to the model
+
+// Fetches up to MAX_CHAT_HISTORY prior messages (oldest first) for this user,
+// optionally bounded by an id (used when editing/regenerating mid-conversation),
+// then calls the AI and returns its reply text. Never throws — falls back to a
+// friendly message on any provider failure, matching the original behavior.
+async function fetchChatHistory(userId, { beforeId = null, includeId = null } = {}) {
+  let sql = `SELECT role, content FROM chat WHERE user_id = ?`;
+  const params = [userId];
+  if (beforeId !== null) {
+    sql += ` AND id < ?`;
+    params.push(beforeId);
+  } else if (includeId !== null) {
+    sql += ` AND id <= ?`;
+    params.push(includeId);
+  }
+  // NOTE: LIMIT can't be a bound parameter over MySQL/TiDB's prepared-statement
+  // protocol — MAX_CHAT_HISTORY is a fixed server constant, safe to inline.
+  sql += ` ORDER BY id DESC LIMIT ${Number(MAX_CHAT_HISTORY)}`;
+  const [rows] = await pool.execute(sql, params);
+  return rows.reverse().map((r) => ({ role: r.role, content: r.content }));
+}
+
+async function generateAssistantReply(userId, history) {
+  try {
+    const financialContext = await buildFinancialContext(userId);
+    const systemPrompt = `${SYSTEM_PROMPT_BASE}\n\n${financialContext}`;
+    return await getAIReply(systemPrompt, history);
+  } catch (err) {
+    console.error("AI fallback error:", err);
+    return "The AI Advisor is temporarily unavailable. This can happen if all providers are busy or keys are missing. Please try again shortly.";
+  }
+}
+
+function parseChatIdParam(req, res) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ error: "Invalid message id" });
+    return null;
+  }
+  return id;
+}
 
 app.post("/api/chat", async (req, res) => {
   const body = validate(chatSchema, req.body, res);
@@ -1030,39 +1177,90 @@ app.post("/api/chat", async (req, res) => {
       body.message,
     ]);
 
-    try {
-      const [rows] = await pool.execute(
-        // NOTE: MySQL/TiDB's prepared-statement protocol does not allow a
-        // bound parameter for LIMIT — it must be a literal in the SQL text.
-        // MAX_CHAT_HISTORY is a fixed server-side constant (never user input),
-        // so inlining it here is safe.
-        `SELECT role, content FROM chat WHERE user_id = ? ORDER BY id DESC LIMIT ${Number(MAX_CHAT_HISTORY)}`,
-        [req.userId]
-      );
-      const history = rows.reverse().map((r) => ({ role: r.role, content: r.content }));
-      const financialContext = await buildFinancialContext(req.userId);
-      const systemPrompt = `${SYSTEM_PROMPT_BASE}\n\n${financialContext}`;
-
-      const reply = await getAIReply(systemPrompt, history);
-      await pool.execute("INSERT INTO chat (user_id, role, content) VALUES (?, ?, ?)", [
-        req.userId,
-        "assistant",
-        reply,
-      ]);
-      res.json({ reply });
-    } catch (err) {
-      console.error("AI fallback error:", err);
-      const fallback =
-        "The AI Advisor is temporarily unavailable. This can happen if all providers are busy or keys are missing. Please try again shortly.";
-      await pool.execute("INSERT INTO chat (user_id, role, content) VALUES (?, ?, ?)", [
-        req.userId,
-        "assistant",
-        fallback,
-      ]);
-      res.json({ reply: fallback });
-    }
+    const history = await fetchChatHistory(req.userId);
+    const reply = await generateAssistantReply(req.userId, history);
+    await pool.execute("INSERT INTO chat (user_id, role, content) VALUES (?, ?, ?)", [
+      req.userId,
+      "assistant",
+      reply,
+    ]);
+    res.json({ reply });
   } catch (err) {
     console.error("POST /api/chat failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Edit one of your own past messages: updates its text, drops everything that
+// came after it (the conversation branches from here), and gets a fresh reply.
+app.post("/api/chat/:id/edit", async (req, res) => {
+  const id = parseChatIdParam(req, res);
+  if (id === null) return;
+  const body = validate(chatSchema, req.body, res);
+  if (!body) return;
+
+  try {
+    const [rows] = await pool.execute("SELECT id, role FROM chat WHERE id = ? AND user_id = ?", [id, req.userId]);
+    const target = rows[0];
+    if (!target) return res.status(404).json({ error: "Message not found" });
+    if (target.role !== "user") return res.status(400).json({ error: "Only your own messages can be edited" });
+
+    await pool.execute("UPDATE chat SET content = ? WHERE id = ?", [body.message, id]);
+    await pool.execute("DELETE FROM chat WHERE user_id = ? AND id > ?", [req.userId, id]);
+
+    const history = await fetchChatHistory(req.userId, { includeId: id });
+    const reply = await generateAssistantReply(req.userId, history);
+    await pool.execute("INSERT INTO chat (user_id, role, content) VALUES (?, ?, ?)", [
+      req.userId,
+      "assistant",
+      reply,
+    ]);
+    res.json({ reply });
+  } catch (err) {
+    console.error("POST /api/chat/:id/edit failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Regenerate one of the AI's past replies: drops it (and anything after it),
+// then asks the model again from the same point in the conversation.
+app.post("/api/chat/:id/regenerate", async (req, res) => {
+  const id = parseChatIdParam(req, res);
+  if (id === null) return;
+
+  try {
+    const [rows] = await pool.execute("SELECT id, role FROM chat WHERE id = ? AND user_id = ?", [id, req.userId]);
+    const target = rows[0];
+    if (!target) return res.status(404).json({ error: "Message not found" });
+    if (target.role !== "assistant") return res.status(400).json({ error: "Only an AI reply can be regenerated" });
+
+    await pool.execute("DELETE FROM chat WHERE user_id = ? AND id >= ?", [req.userId, id]);
+
+    const history = await fetchChatHistory(req.userId, { beforeId: id });
+    const reply = await generateAssistantReply(req.userId, history);
+    await pool.execute("INSERT INTO chat (user_id, role, content) VALUES (?, ?, ?)", [
+      req.userId,
+      "assistant",
+      reply,
+    ]);
+    res.json({ reply });
+  } catch (err) {
+    console.error("POST /api/chat/:id/regenerate failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Delete a single message (no cascading — just that one row).
+app.delete("/api/chat/:id", async (req, res) => {
+  const id = parseChatIdParam(req, res);
+  if (id === null) return;
+
+  try {
+    const [result] = await pool.execute("DELETE FROM chat WHERE id = ? AND user_id = ?", [id, req.userId]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Message not found" });
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error("DELETE /api/chat/:id failed:", err.message);
     res.status(500).json({ error: "Database error" });
   }
 });
