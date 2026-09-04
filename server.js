@@ -186,7 +186,9 @@ async function initSchema() {
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'unpaid'",
     // Google sign-in: existing accounts keep their password; new Google-only
     // accounts have no password, so the column can no longer be NOT NULL.
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255) UNIQUE",
+    // NOTE: TiDB rejects "ADD COLUMN ... UNIQUE" in one statement, so the
+    // column and its unique index are added separately below.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)",
     "ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) NULL",
   ];
   for (const sql of migrations) {
@@ -195,6 +197,22 @@ async function initSchema() {
     } catch (err) {
       console.error("Migration skipped:", sql, err.message);
     }
+  }
+
+  // Add a unique index on google_id if it doesn't already exist.
+  // TiDB doesn't support "ADD INDEX IF NOT EXISTS", so check information_schema first.
+  try {
+    const [rows] = await pool.query(
+      `SELECT COUNT(*) AS cnt FROM information_schema.statistics
+       WHERE table_schema = DATABASE() AND table_name = 'users' AND index_name = 'idx_users_google_id'`
+    );
+    if (rows[0].cnt === 0) {
+      await pool.query(
+        "ALTER TABLE users ADD UNIQUE INDEX idx_users_google_id (google_id)"
+      );
+    }
+  } catch (err) {
+    console.error("Migration skipped: add unique index idx_users_google_id", err.message);
   }
 }
 
