@@ -1863,7 +1863,7 @@ app.get("/api/reports/gst", async (req, res) => {
   const end = parsed.end || dp.end;
   try {
     const [invRows] = await pool.execute(
-      "SELECT date, items, grand, gst_total FROM invoices WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date",
+      "SELECT date, items, grand, gstTotal FROM invoices WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date",
       [req.userId, start, end]
     );
 
@@ -1872,7 +1872,13 @@ app.get("/api/reports/gst", async (req, res) => {
     const taxableByRate = {};
     for (const inv of invRows) {
       invoiceCount += 1;
-      const items = JSON.parse(inv.items);
+      let items;
+      try {
+        items = JSON.parse(inv.items);
+        if (!Array.isArray(items)) items = [];
+      } catch {
+        items = [];
+      }
       for (const item of items) {
         const base = (parseFloat(item.rate) || 0) * (parseFloat(item.qty) || 0);
         const gstPct = parseFloat(item.gst) || 0;
