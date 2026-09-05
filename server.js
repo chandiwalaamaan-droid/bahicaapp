@@ -178,12 +178,52 @@ async function initSchema() {
     )
   `);
 
+  // Recurring invoice templates: generate a real invoice on a schedule.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS recurring_invoices (
+      id VARCHAR(64) PRIMARY KEY,
+      user_id VARCHAR(36) NOT NULL,
+      client VARCHAR(255) NOT NULL,
+      client_gstin VARCHAR(15),
+      client_address TEXT,
+      items TEXT NOT NULL,
+      subtotal DECIMAL(15,2) NOT NULL,
+      gst_total DECIMAL(15,2) NOT NULL,
+      grand DECIMAL(15,2) NOT NULL,
+      frequency VARCHAR(16) NOT NULL DEFAULT 'monthly',
+      start_date VARCHAR(10) NOT NULL,
+      end_date VARCHAR(10),
+      next_date VARCHAR(10) NOT NULL,
+      payment_terms INT NOT NULL DEFAULT 14,
+      status VARCHAR(16) NOT NULL DEFAULT 'active',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_ri_user (user_id),
+      INDEX idx_ri_next (next_date)
+    )
+  `);
+
+  // In-app notifications (due-date reminders, recurring generation alerts, etc.)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id VARCHAR(64) PRIMARY KEY,
+      user_id VARCHAR(36) NOT NULL,
+      type VARCHAR(32) NOT NULL,
+      message TEXT NOT NULL,
+      link TEXT,
+      is_read BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_notif_user (user_id, is_read, created_at),
+      INDEX idx_notif_created (created_at)
+    )
+  `);
+
   // Safe no-op if columns already exist (idempotent for pre-existing deployments).
   const migrations = [
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS client_gstin VARCHAR(15)",
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS client_address TEXT",
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS due_date VARCHAR(10)",
     "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'unpaid'",
+    "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS gst_amount DECIMAL(15,2) NOT NULL DEFAULT 0",
     // Google sign-in: existing accounts keep their password; new Google-only
     // accounts have no password, so the column can no longer be NOT NULL.
     // NOTE: TiDB rejects "ADD COLUMN ... UNIQUE" in one statement, so the
@@ -234,6 +274,24 @@ function requireAuth(req, res, next) {
   }
 }
 
+// ---------- Date helpers ----------
+const todayISO = () => new Date().toISOString().slice(0, 10);
+function addDays(dateStr, days) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function advanceDate(dateStr, frequency) {
+  const d = new Date(dateStr);
+  if (frequency === "monthly") d.setMonth(d.getMonth() + 1);
+  else if (frequency === "quarterly") d.setMonth(d.getMonth() + 3);
+  else if (frequency === "yearly") d.setFullYear(d.getFullYear() + 1);
+  return d.toISOString().slice(0, 10);
+}
+function monthKey(iso) {
+  return iso.slice(0, 7);
+}
+
 // ---------- Validation schemas ----------
 const emailSchema = z.string().trim().toLowerCase().email().max(255);
 const passwordSchema = z.string().min(8).max(200);
@@ -251,6 +309,10 @@ const txnSchema = z.object({
   category: z.string().trim().min(1).max(64),
   amount: z.coerce.number().finite().positive().max(999999999999),
   note: z.string().trim().max(2000).optional().default(""),
+  gst_amount: z.preprocess(
+    (v) => (v === undefined || v === "" || v === null ? 0 : v),
+    z.coerce.number().finite().nonnegative().max(999999999999)
+  ).optional().default(0),
 });
 
 const businessProfileSchema = z.object({
@@ -521,6 +583,9 @@ app.use("/api/invoices", requireAuth);
 app.use("/api/invoice-notes", requireAuth);
 app.use("/api/chat", requireAuth);
 app.use("/api/business-profile", requireAuth);
+app.use("/api/recurring", requireAuth);
+app.use("/api/notifications", requireAuth);
+app.use("/api/reports", requireAuth);
 
 // ---------- Business profile ----------
 app.get("/api/business-profile", async (req, res) => {
@@ -565,7 +630,7 @@ app.put("/api/business-profile", async (req, res) => {
 
 // ---------- AI providers ----------
 const SYSTEM_PROMPT_BASE =
-  "You are the AI Advisor inside 'Bahi', a personal accounting web app for Indian users (accessed at whatever URL the user visits it at — you don't know a fixed domain, so never invent one like 'bahi.in'). The app has exactly these sections, shown as tabs in the sidebar: Dashboard (income/expense/GST summary), Transactions (log income and expenses by category), Invoices (create GST invoices, mark paid/unpaid, issue credit/debit notes), Tax Calculator (income tax estimate), GST Calculator, AI Advisor (this chat), and Business Profile (name, GSTIN, PAN, address). There is no separate login domain, no 'magic link' sign-in, no Chart of Accounts, no Planner/recurring transactions, and no separate Reports section — do not describe features that aren't in this list, even if they sound plausible for an accounting app. If asked how to do something in the app, only describe these real tabs and actions. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (FY 2025-26: new regime default, slabs 0-4L nil/4-8L 5%/8-12L 10%/12-16L 15%/16-20L 20%/20-24L 25%/>24L 30%, 87A rebate up to 12L taxable income; old regime slabs 0-2.5L nil/2.5-5L 5%/5-10L 20%/>10L 30%). Be direct and confident, like a sharp advisor who knows the numbers — don't hedge on routine questions. Show your math in short form (e.g. \"₹8L × 10% = ₹80,000\") so the person can follow and trust the figure, not just take it on faith. You are an AI assistant, not a licensed Chartered Accountant; only say so explicitly when it actually matters — filings, large or unusual transactions, notices from the tax department, or anything the person could get penalized for — and even then keep it to one short line recommending they confirm with a qualified CA, not a disclaimer on every message. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.";
+  "You are the AI Advisor inside 'Bahi', a personal accounting web app for Indian users (accessed at whatever URL the user visits it at — you don't know a fixed domain, so never invent one like 'bahi.in'). The app has exactly these sections, shown as tabs in the sidebar: Dashboard (income/expense/GST summary), Transactions (log income and expenses by category, with quick-add and auto-categorize from notes), Invoices (create GST invoices, mark paid/unpaid, issue credit/debit notes, and set up recurring templates that auto-generate on a schedule), Reports (profit and loss, cash flow, GST summary, and trend charts), Tax Calculator (income tax estimate) (income tax estimate), GST Calculator, AI Advisor (this chat), and Business Profile (name, GSTIN, PAN, address). The app also sends in-app notifications for due-date reminders and when recurring invoices auto-generate. There is no separate login domain, no 'magic link' sign-in, no Chart of Accounts. Do not describe features that aren't in this list, even if they sound plausible for an accounting app. If asked how to do something in the app, only describe these real tabs and actions. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (FY 2025-26: new regime default, slabs 0-4L nil/4-8L 5%/8-12L 10%/12-16L 15%/16-20L 20%/20-24L 25%/>24L 30%, 87A rebate up to 12L taxable income; old regime slabs 0-2.5L nil/2.5-5L 5%/5-10L 20%/>10L 30%). Be direct and confident, like a sharp advisor who knows the numbers — don't hedge on routine questions. Show your math in short form (e.g. \"₹8L × 10% = ₹80,000\") so the person can follow and trust the figure, not just take it on faith. You are an AI assistant, not a licensed Chartered Accountant; only say so explicitly when it actually matters — filings, large or unusual transactions, notices from the tax department, or anything the person could get penalized for — and even then keep it to one short line recommending they confirm with a qualified CA, not a disclaimer on every message. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.";
 
 const PROVIDER_TIMEOUT = 15000;
 
@@ -874,10 +939,10 @@ async function buildFinancialContext(userId) {
 app.get("/api/transactions", async (req, res) => {
   try {
     const [rows] = await pool.execute(
-      "SELECT id, date, type, category, amount, note FROM transactions WHERE user_id = ? ORDER BY date DESC",
+      "SELECT id, date, type, category, amount, note, gst_amount FROM transactions WHERE user_id = ? ORDER BY date DESC",
       [req.userId]
     );
-    res.json(rows.map((r) => ({ ...r, amount: Number(r.amount) })));
+    res.json(rows.map((r) => ({ ...r, amount: Number(r.amount), gst_amount: Number(r.gst_amount) })));
   } catch (err) {
     console.error("GET /api/transactions failed:", err.message);
     res.status(500).json({ error: "Database error" });
@@ -902,15 +967,15 @@ app.post("/api/transactions", async (req, res) => {
   if (!body) return;
   try {
     await pool.execute(
-      "INSERT INTO transactions (id, user_id, date, type, category, amount, note) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [body.id, req.userId, body.date, body.type, body.category, body.amount, body.note || ""]
+      "INSERT INTO transactions (id, user_id, date, type, category, amount, note, gst_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [body.id, req.userId, body.date, body.type, body.category, body.amount, body.note || "", body.gst_amount || 0]
     );
     const [rows] = await pool.execute(
-      "SELECT id, date, type, category, amount, note FROM transactions WHERE id = ? AND user_id = ?",
+      "SELECT id, date, type, category, amount, note, gst_amount FROM transactions WHERE id = ? AND user_id = ?",
       [body.id, req.userId]
     );
     const row = rows[0];
-    res.json({ ...row, amount: Number(row.amount) });
+    res.json({ ...row, amount: Number(row.amount), gst_amount: Number(row.gst_amount) });
   } catch (err) {
     console.error("POST /api/transactions failed:", err.message);
     res.status(500).json({ error: "Database error" });
@@ -928,15 +993,15 @@ app.put("/api/transactions/:id", async (req, res) => {
     if (!existing.length) return res.status(404).json({ error: "Transaction not found" });
 
     await pool.execute(
-      "UPDATE transactions SET date=?, type=?, category=?, amount=?, note=? WHERE id=? AND user_id=?",
-      [body.date, body.type, body.category, body.amount, body.note || "", req.params.id, req.userId]
+      "UPDATE transactions SET date=?, type=?, category=?, amount=?, note=?, gst_amount=? WHERE id=? AND user_id=?",
+      [body.date, body.type, body.category, body.amount, body.note || "", body.gst_amount || 0, req.params.id, req.userId]
     );
     const [rows] = await pool.execute(
-      "SELECT id, date, type, category, amount, note FROM transactions WHERE id = ? AND user_id = ?",
+      "SELECT id, date, type, category, amount, note, gst_amount FROM transactions WHERE id = ? AND user_id = ?",
       [req.params.id, req.userId]
     );
     const row = rows[0];
-    res.json({ ...row, amount: Number(row.amount) });
+    res.json({ ...row, amount: Number(row.amount), gst_amount: Number(row.gst_amount) });
   } catch (err) {
     console.error("PUT /api/transactions failed:", err.message);
     res.status(500).json({ error: "Database error" });
@@ -1390,9 +1455,644 @@ app.delete("/api/chat/:id", async (req, res) => {
   }
 });
 
+// ---------- Auto-categorize (rules-based, no AI required) ----------
+// Keyword rules for guessing a transaction's type + category from its note text.
+// Works without any AI provider keys; the AI quick-add (/parse) is still available
+// as a richer alternative for free-text entry.
+const CATEGORY_KEYWORDS = {
+  "Client payment": ["client", "received from", "payment", "invoice", "paid by"],
+  "Salary": ["salary", "salary"],
+  "Freelance": ["freelance", "consulting", "contract"],
+  "Interest": ["interest", "dividend"],
+  "Rent": ["rent", "rental", "bhatakni"],
+  "Software/tools": ["canva", "subscription", "software", "tool", "saas", "aws", "hosting", "netflix", "github", "figma", "notion", "adobe", "microsoft 365", "google workspace", "slack", "zoom", "spotify"],
+  "Travel": ["travel", "flight", "air", "uber", "ola", "taxi", "train", "bus", "petrol", "fuel", "railway"],
+  "Supplies": ["supplies", "stationery", "notebook", "pen", "paper", "printer", "ink"],
+  "Utilities": ["electricity", "water bill", "internet", "wifi", "broadband", "phone", "mobile", "diesel", "gas"],
+  "Salaries paid": ["salary to", "wages", "payroll", "employee"],
+  "Marketing": ["marketing", "ads", "advertisement", "facebook", "instagram", "google ads", "promotion", "ppc", "campaign"],
+  "Taxes": ["gst", "tax", "income tax", "fee", "penalty", "compliance", "filings"],
+};
+
+function categorizeNote(text) {
+  const lower = (text || "").toLowerCase().trim();
+  if (!lower) return { type: "expense", category: "Other expense" };
+
+  let best = null;
+  let bestScore = 0;
+  for (const [category, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+    let score = 0;
+    for (const kw of keywords) if (lower.includes(kw)) score += 1;
+    const isIncome = QUICK_ADD_CATEGORIES.income.includes(category);
+    if (score > bestScore) {
+      bestScore = score;
+      best = { type: isIncome ? "income" : "expense", category };
+    }
+  }
+  if (!best || bestScore === 0) return { type: "expense", category: "Other expense" };
+  return best;
+}
+
+const categorizeSchema = z.object({ text: z.string().trim().min(1).max(500) });
+
+app.post("/api/transactions/categorize", async (req, res) => {
+  const body = validate(categorizeSchema, req.body, res);
+  if (!body) return;
+  const result = categorizeNote(body.text);
+  res.json(result);
+});
+
+// ---------- Recurring invoices ----------
+const recurringSchema = z.object({
+  id: z.string().min(1).max(64),
+  client: z.string().trim().min(1).max(255),
+  clientGstin: z.string().trim().toUpperCase().regex(/^[0-9A-Z]{15}$/, "GSTIN must be 15 characters").optional().or(z.literal("")).default(""),
+  clientAddress: z.string().trim().max(1000).optional().default(""),
+  frequency: z.enum(["monthly", "quarterly", "yearly"]).default("monthly"),
+  startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD").optional().or(z.literal("")).default(""),
+  endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD").optional().or(z.literal("")).default(""),
+  paymentTerms: z.coerce.number().int().nonnegative().max(365).optional().default(14),
+  status: z.enum(["active", "paused"]).optional().default("active"),
+  items: z.array(invoiceItemSchema).min(1).max(200),
+});
+
+app.get("/api/recurring", async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      "SELECT id, client, client_gstin, client_address, frequency, start_date, end_date, next_date, payment_terms, status, items, subtotal, gst_total, grand, created_at FROM recurring_invoices WHERE user_id = ? ORDER BY created_at DESC",
+      [req.userId]
+    );
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        client: r.client,
+        clientGstin: r.client_gstin || "",
+        clientAddress: r.client_address || "",
+        frequency: r.frequency,
+        startDate: r.start_date || "",
+        endDate: r.end_date || "",
+        nextDate: r.next_date || "",
+        paymentTerms: Number(r.payment_terms || 0),
+        status: r.status,
+        items: JSON.parse(r.items),
+        subtotal: Number(r.subtotal),
+        gstTotal: Number(r.gst_total),
+        grand: Number(r.grand),
+        createdAt: r.created_at,
+      }))
+    );
+  } catch (err) {
+    console.error("GET /api/recurring failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/recurring", async (req, res) => {
+  const body = validate(recurringSchema, req.body, res);
+  if (!body) return;
+  try {
+    const id = crypto.randomUUID();
+    const startDate = body.startDate || todayISO();
+    const nextDate = body.startDate || todayISO();
+    await pool.execute(
+      `INSERT INTO recurring_invoices
+        (id, user_id, client, client_gstin, client_address, items, subtotal, gst_total, grand,
+         frequency, start_date, end_date, next_date, payment_terms, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, req.userId, body.client, body.clientGstin || null, body.clientAddress || null,
+        JSON.stringify(body.items),
+        body.items.reduce((s, it) => s + (parseFloat(it.rate) || 0) * (parseFloat(it.qty) || 0), 0),
+        body.items.reduce((s, it) => s + ((parseFloat(it.rate) || 0) * (parseFloat(it.qty) || 0) * (parseFloat(it.gst) || 0)) / 100, 0),
+        body.items.reduce((s, it) => s + (parseFloat(it.rate) || 0) * (parseFloat(it.qty) || 0) * (1 + (parseFloat(it.gst) || 0) / 100), 0),
+        body.frequency, startDate, body.endDate || null, nextDate, body.paymentTerms, body.status,
+      ]
+    );
+    const [rows] = await pool.execute(
+      "SELECT id, client, client_gstin, client_address, frequency, start_date, end_date, next_date, payment_terms, status, items, subtotal, gst_total, grand FROM recurring_invoices WHERE id = ?",
+      [id]
+    );
+    const r = rows[0];
+    res.json({
+      id: r.id, client: r.client, clientGstin: r.client_gstin || "", clientAddress: r.client_address || "",
+      frequency: r.frequency, startDate: r.start_date || "", endDate: r.end_date || "", nextDate: r.next_date || "",
+      paymentTerms: Number(r.payment_terms || 0), status: r.status, items: JSON.parse(r.items),
+      subtotal: Number(r.subtotal), gstTotal: Number(r.gst_total), grand: Number(r.grand),
+    });
+  } catch (err) {
+    console.error("POST /api/recurring failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.put("/api/recurring/:id", async (req, res) => {
+  const body = validate(recurringSchema.partial({ id: true }), req.body, res);
+  if (!body) return;
+  try {
+    const [existing] = await pool.execute("SELECT id FROM recurring_invoices WHERE id = ? AND user_id = ?", [req.params.id, req.userId]);
+    if (!existing.length) return res.status(404).json({ error: "Recurring invoice not found" });
+
+    const subtotal = body.items ? body.items.reduce((s, it) => s + (parseFloat(it.rate) || 0) * (parseFloat(it.qty) || 0), 0) : undefined;
+    const gstTotal = body.items ? body.items.reduce((s, it) => s + ((parseFloat(it.rate) || 0) * (parseFloat(it.qty) || 0) * (parseFloat(it.gst) || 0)) / 100, 0) : undefined;
+    const grand = body.items ? subtotal + gstTotal : undefined;
+
+    const updates = [];
+    const params = [];
+    if (body.client !== undefined) { updates.push("client = ?"); params.push(body.client); }
+    if (body.clientGstin !== undefined) { updates.push("client_gstin = ?"); params.push(body.clientGstin || null); }
+    if (body.clientAddress !== undefined) { updates.push("client_address = ?"); params.push(body.clientAddress || null); }
+    if (body.frequency !== undefined) { updates.push("frequency = ?"); params.push(body.frequency); }
+    if (body.startDate !== undefined) { updates.push("start_date = ?"); params.push(body.startDate || null); }
+    if (body.endDate !== undefined) { updates.push("end_date = ?"); params.push(body.endDate || null); }
+    if (body.status !== undefined) { updates.push("status = ?"); params.push(body.status); }
+    if (body.paymentTerms !== undefined) { updates.push("payment_terms = ?"); params.push(body.paymentTerms); }
+    if (body.items !== undefined) {
+      updates.push("items = ?"); params.push(JSON.stringify(body.items));
+      updates.push("subtotal = ?"); params.push(subtotal);
+      updates.push("gst_total = ?"); params.push(gstTotal);
+      updates.push("grand = ?"); params.push(grand);
+    }
+    params.push(req.params.id, req.userId);
+    await pool.execute(
+      `UPDATE recurring_invoices SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`,
+      params
+    );
+
+    const [rows] = await pool.execute(
+      "SELECT id, client, client_gstin, client_address, frequency, start_date, end_date, next_date, payment_terms, status, items, subtotal, gst_total, grand FROM recurring_invoices WHERE id = ?",
+      [req.params.id]
+    );
+    const r = rows[0];
+    res.json({
+      id: r.id, client: r.client, clientGstin: r.client_gstin || "", clientAddress: r.client_address || "",
+      frequency: r.frequency, startDate: r.start_date || "", endDate: r.end_date || "", nextDate: r.next_date || "",
+      paymentTerms: Number(r.payment_terms || 0), status: r.status, items: JSON.parse(r.items),
+      subtotal: Number(r.subtotal), gstTotal: Number(r.gst_total), grand: Number(r.grand),
+    });
+  } catch (err) {
+    console.error("PUT /api/recurring/:id failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.delete("/api/recurring/:id", async (req, res) => {
+  try {
+    const [result] = await pool.execute("DELETE FROM recurring_invoices WHERE id = ? AND user_id = ?", [req.params.id, req.userId]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Recurring invoice not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /api/recurring/:id failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Manually generate an invoice from a recurring template now.
+app.post("/api/recurring/:id/generate", async (req, res) => {
+  try {
+    const [rows] = await pool.execute("SELECT * FROM recurring_invoices WHERE id = ? AND user_id = ?", [req.params.id, req.userId]);
+    const ri = rows[0];
+    if (!ri) return res.status(404).json({ error: "Recurring invoice not found" });
+
+    const invoiceId = crypto.randomUUID();
+    const conn = await pool.getConnection();
+    await conn.beginTransaction();
+    try {
+      await conn.execute(
+        "INSERT INTO invoice_counters (user_id, next_number) VALUES (?, 2) ON DUPLICATE KEY UPDATE next_number = next_number + 1",
+        [req.userId]
+      );
+      const [[counterRow]] = await conn.execute("SELECT next_number FROM invoice_counters WHERE user_id = ?", [req.userId]);
+      const seq = counterRow.next_number - 1;
+      const number = `INV-${String(seq).padStart(4, "0")}`;
+      const dueDate = addDays(ri.next_date, Number(ri.payment_terms || 14));
+
+      await conn.execute(
+        `INSERT INTO invoices
+          (id, user_id, number, client, client_gstin, client_address, date, due_date, status, items, subtotal, gstTotal, grand)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          invoiceId, req.userId, number, ri.client, ri.client_gstin || null, ri.client_address || null,
+          ri.next_date, dueDate, "unpaid", ri.items, ri.subtotal, ri.gst_total, ri.grand,
+        ]
+      );
+
+      // Advance next_date
+      const newNext = advanceDate(ri.next_date, ri.frequency);
+      if (ri.end_date && newNext > ri.end_date) {
+        await conn.execute("UPDATE recurring_invoices SET next_date = ?, status = 'completed' WHERE id = ?", [ri.end_date, ri.id]);
+      } else {
+        await conn.execute("UPDATE recurring_invoices SET next_date = ? WHERE id = ?", [newNext, ri.id]);
+      }
+
+      await conn.execute(
+        "INSERT INTO notifications (id, user_id, type, message, link, is_read) VALUES (?, ?, ?, ?, ?, FALSE)",
+        [crypto.randomUUID(), req.userId, "recurring_generated", `Recurring invoice ${number} for ${ri.client} was generated.`, `/invoices:${invoiceId}`]
+      );
+
+      await conn.commit();
+      res.json({ ok: true, invoiceId, number });
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+  } catch (err) {
+    console.error("POST /api/recurring/:id/generate failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ---------- Notifications ----------
+app.get("/api/notifications", async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || "50"), 100);
+    const [rows] = await pool.execute(
+      "SELECT id, type, message, link, is_read, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+      [req.userId, limit]
+    );
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        type: r.type,
+        message: r.message,
+        link: r.link || null,
+        isRead: Boolean(r.is_read),
+        createdAt: r.created_at,
+      }))
+    );
+  } catch (err) {
+    console.error("GET /api/notifications failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/notifications/read", async (req, res) => {
+  try {
+    await pool.execute("UPDATE notifications SET is_read = TRUE WHERE user_id = ? AND is_read = FALSE", [req.userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/notifications/read failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+app.post("/api/notifications/:id/read", async (req, res) => {
+  try {
+    const [result] = await pool.execute("UPDATE notifications SET is_read = TRUE WHERE id = ? AND user_id = ?", [req.params.id, req.userId]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: "Notification not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/notifications/:id/read failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ---------- Reports ----------
+const reportPeriodSchema = z.object({
+  start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "start must be YYYY-MM-DD").optional(),
+  end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "end must be YYYY-MM-DD").optional(),
+});
+
+function defaultPeriod() {
+  const end = todayISO();
+  const d = new Date();
+  d.setMonth(d.getMonth() - 11);
+  d.setDate(1);
+  const start = d.toISOString().slice(0, 10);
+  return { start, end };
+}
+
+// Profit & Loss: income vs expenses by category for the period.
+app.get("/api/reports/pnl", async (req, res) => {
+  const parsed = validate(reportPeriodSchema, req.query, res);
+  if (!parsed) return;
+  const dp = defaultPeriod();
+  const start = parsed.start || dp.start;
+  const end = parsed.end || dp.end;
+  try {
+    const [txns] = await pool.execute(
+      "SELECT date, type, category, amount FROM transactions WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date",
+      [req.userId, start, end]
+    );
+
+    let income = 0, expense = 0;
+    const incomeByCat = {}, expenseByCat = {};
+    for (const t of txns) {
+      const amt = Number(t.amount);
+      if (t.type === "income") {
+        income += amt;
+        incomeByCat[t.category] = (incomeByCat[t.category] || 0) + amt;
+      } else {
+        expense += amt;
+        expenseByCat[t.category] = (expenseByCat[t.category] || 0) + amt;
+      }
+    }
+
+    res.json({
+      period: { start, end },
+      income: { total: income, byCategory: incomeByCat },
+      expenses: { total: expense, byCategory: expenseByCat },
+      netProfit: income - expense,
+      transactionCount: txns.length,
+    });
+  } catch (err) {
+    console.error("GET /api/reports/pnl failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Cash flow: daily and monthly aggregation of income vs expenses.
+app.get("/api/reports/cashflow", async (req, res) => {
+  const parsed = validate(reportPeriodSchema, req.query, res);
+  if (!parsed) return;
+  const dp = defaultPeriod();
+  const start = parsed.start || dp.start;
+  const end = parsed.end || dp.end;
+  try {
+    const [txns] = await pool.execute(
+      "SELECT date, type, amount FROM transactions WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date",
+      [req.userId, start, end]
+    );
+
+    const byDay = {};
+    const byMonth = {};
+    for (const t of txns) {
+      const d = t.date;
+      const m = monthKey(d);
+      const amt = Number(t.amount);
+      if (!byDay[d]) byDay[d] = { income: 0, expense: 0 };
+      if (!byMonth[m]) byMonth[m] = { income: 0, expense: 0, count: 0 };
+      if (t.type === "income") {
+        byDay[d].income += amt;
+        byMonth[m].income += amt;
+      } else {
+        byDay[d].expense += amt;
+        byMonth[m].expense += amt;
+      }
+      byMonth[m].count += 1;
+    }
+
+    const days = Object.keys(byDay).sort().map((d) => ({
+      date: d, income: byDay[d].income, expense: byDay[d].expense, net: byDay[d].income - byDay[d].expense,
+    }));
+    const months = Object.keys(byMonth).sort().map((m) => ({
+      month: m, income: byMonth[m].income, expense: byMonth[m].expense, net: byMonth[m].income - byMonth[m].expense, txns: byMonth[m].count,
+    }));
+
+    const netCashFlow = txns.reduce((s, t) => s + (t.type === "income" ? 1 : -1) * Number(t.amount), 0);
+
+    res.json({
+      period: { start, end },
+      netCashFlow,
+      byDay: days,
+      byMonth: months,
+    });
+  } catch (err) {
+    console.error("GET /api/reports/cashflow failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// GST summary: output tax (from invoices) by rate, input tax (from expenses), net payable.
+app.get("/api/reports/gst", async (req, res) => {
+  const parsed = validate(reportPeriodSchema, req.query, res);
+  if (!parsed) return;
+  const dp = defaultPeriod();
+  const start = parsed.start || dp.start;
+  const end = parsed.end || dp.end;
+  try {
+    const [invRows] = await pool.execute(
+      "SELECT date, items, grand, gst_total FROM invoices WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date",
+      [req.userId, start, end]
+    );
+
+    const byRate = {};
+    let totalTaxable = 0, totalGst = 0, totalBilled = 0, invoiceCount = 0;
+    const taxableByRate = {};
+    for (const inv of invRows) {
+      invoiceCount += 1;
+      const items = JSON.parse(inv.items);
+      for (const item of items) {
+        const base = (parseFloat(item.rate) || 0) * (parseFloat(item.qty) || 0);
+        const gstPct = parseFloat(item.gst) || 0;
+        const gstAmt = (base * gstPct) / 100;
+        const rateStr = String(gstPct || 0);
+        if (!byRate[rateStr]) byRate[rateStr] = { count: 0, taxable: 0, gst: 0, total: 0 };
+        byRate[rateStr].count += 1;
+        byRate[rateStr].taxable += base;
+        byRate[rateStr].gst += gstAmt;
+        byRate[rateStr].total += base + gstAmt;
+        totalTaxable += base;
+        totalGst += gstAmt;
+        taxableByRate[rateStr] = (taxableByRate[rateStr] || 0) + base;
+      }
+      totalBilled += Number(inv.grand);
+    }
+
+    // Input tax: GST amounts recorded on expense transactions.
+    const [txnRows] = await pool.execute(
+      "SELECT gst_amount FROM transactions WHERE user_id = ? AND type = 'expense' AND gst_amount > 0 AND date >= ? AND date <= ?",
+      [req.userId, start, end]
+    );
+    const inputGst = txnRows.reduce((s, r) => s + Number(r.gst_amount), 0);
+
+    res.json({
+      period: { start, end },
+      outputTax: { totalGst, totalTaxable, totalBilled, byRate },
+      inputTax: inputGst,
+      netGstPayable: totalGst - inputGst,
+      invoiceCount,
+    });
+  } catch (err) {
+    console.error("GET /api/reports/gst failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// Trends: monthly income/expense/invoice totals for the last N months.
+app.get("/api/reports/trends", async (req, res) => {
+  const months = Math.min(Math.max(parseInt(req.query.months || "12"), 1), 36);
+  try {
+    const d = new Date();
+    d.setMonth(d.getMonth() - months + 1);
+    d.setDate(1);
+    const start = d.toISOString().slice(0, 10);
+
+    const [txns] = await pool.execute(
+      "SELECT date, type, amount FROM transactions WHERE user_id = ? AND date >= ? ORDER BY date",
+      [req.userId, start]
+    );
+    const [invRows] = await pool.execute(
+      "SELECT date, grand FROM invoices WHERE user_id = ? AND date >= ? ORDER BY date",
+      [req.userId, start]
+    );
+
+    const byMonth = {};
+    for (let i = 0; i < months; i++) {
+      const m = new Date();
+      m.setMonth(m.getMonth() - i);
+      const key = `${m.getFullYear()}-${String(m.getMonth() + 1).padStart(2, "0")}`;
+      byMonth[key] = { month: key, income: 0, expense: 0, invoiceTotal: 0, invoiceCount: 0 };
+    }
+    for (const t of txns) {
+      const k = monthKey(t.date);
+      if (!byMonth[k]) continue;
+      const amt = Number(t.amount);
+      if (t.type === "income") byMonth[k].income += amt;
+      else byMonth[k].expense += amt;
+    }
+    for (const inv of invRows) {
+      const k = monthKey(inv.date);
+      if (!byMonth[k]) continue;
+      byMonth[k].invoiceTotal += Number(inv.grand);
+      byMonth[k].invoiceCount += 1;
+    }
+    const labels = Object.keys(byMonth).sort();
+    const trendData = labels.map((k) => ({
+      month: k, income: byMonth[k].income, expense: byMonth[k].expense,
+      net: byMonth[k].income - byMonth[k].expense, invoiceTotal: byMonth[k].invoiceTotal, invoiceCount: byMonth[k].invoiceCount,
+    }));
+
+    // Category breakdown for the most recent non-empty month
+    const latestMonth = labels.find((k) => byMonth[k].income > 0 || byMonth[k].expense > 0) || labels[labels.length - 1];
+    let catBreakdown = { income: {}, expense: {} };
+    if (latestMonth) {
+      const [monthTxns] = await pool.execute(
+        "SELECT type, category, amount FROM transactions WHERE user_id = ? AND date LIKE ? ORDER BY date DESC",
+        [req.userId, `${latestMonth}%`]
+      );
+      for (const t of monthTxns) {
+        const bk = t.type === "income" ? catBreakdown.income : catBreakdown.expense;
+        bk[t.category] = (bk[t.category] || 0) + Number(t.amount);
+      }
+    }
+
+    res.json({ months: trendData, latestMonth, categoryBreakdown: catBreakdown });
+  } catch (err) {
+    console.error("GET /api/reports/trends failed:", err.message);
+    res.status(500).json({ error: "Database error" });
+  }
+});
+
+// ---------- Background jobs: recurring generation + due-date reminders ----------
+// Runs periodically (every hour) while the server process is alive. On each tick it
+// generates any overdue recurring invoices as real invoices and sends a
+// notification for unpaid invoices whose due date has passed.
+let jobRunning = false;
+
+async function backgroundJobs() {
+  if (jobRunning) return;
+  jobRunning = true;
+  try {
+    await generateDueRecurringInvoices();
+    await checkOverdueInvoices();
+  } catch (err) {
+    console.error("Background job error:", err.message);
+  } finally {
+    jobRunning = false;
+  }
+}
+
+async function generateDueRecurringInvoices() {
+  try {
+    const today = todayISO();
+    const [rows] = await pool.execute(
+      "SELECT * FROM recurring_invoices WHERE status = 'active' AND next_date <= ? ORDER BY user_id",
+      [today]
+    );
+    for (const ri of rows) {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await conn.execute(
+          "INSERT INTO invoice_counters (user_id, next_number) VALUES (?, 2) ON DUPLICATE KEY UPDATE next_number = next_number + 1",
+          [ri.user_id]
+        );
+        const [[counterRow]] = await conn.execute("SELECT next_number FROM invoice_counters WHERE user_id = ?", [ri.user_id]);
+        const seq = counterRow.next_number - 1;
+        const number = `INV-${String(seq).padStart(4, "0")}`;
+        const invoiceId = crypto.randomUUID();
+        const dueDate = addDays(ri.next_date, Number(ri.payment_terms || 14));
+
+        await conn.execute(
+          `INSERT INTO invoices
+            (id, user_id, number, client, client_gstin, client_address, date, due_date, status, items, subtotal, gstTotal, grand)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            invoiceId, ri.user_id, number, ri.client, ri.client_gstin || null, ri.client_address || null,
+            ri.next_date, dueDate, "unpaid", ri.items, ri.subtotal, ri.gst_total, ri.grand,
+          ]
+        );
+
+        const newNext = advanceDate(ri.next_date, ri.frequency);
+        if (ri.end_date && newNext > ri.end_date) {
+          await conn.execute("UPDATE recurring_invoices SET next_date = ?, status = 'completed' WHERE id = ?", [ri.end_date, ri.id]);
+        } else {
+          await conn.execute("UPDATE recurring_invoices SET next_date = ? WHERE id = ?", [newNext, ri.id]);
+        }
+
+        await conn.execute(
+          "INSERT INTO notifications (id, user_id, type, message, link, is_read) VALUES (?, ?, ?, ?, ?, FALSE)",
+          [crypto.randomUUID(), ri.user_id, "recurring_generated", `Recurring invoice ${number} for ${ri.client} was generated.`, `/invoices:${invoiceId}`]
+        );
+
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback();
+        console.error("Recurring generate error for", ri.id, ":", err.message);
+      } finally {
+        conn.release();
+      }
+    }
+  } catch (err) {
+    console.error("generateDueRecurringInvoices failed:", err.message);
+  }
+}
+
+async function checkOverdueInvoices() {
+  try {
+    const today = todayISO();
+    // Only flag invoices overdue by up to 30 days (avoid re-notifying very old debt).
+    const recentCutoff = addDays(today, -30);
+    const [rows] = await pool.execute(
+      `SELECT id, user_id, number, client, due_date FROM invoices
+       WHERE status = 'unpaid' AND due_date IS NOT NULL AND due_date < ? AND due_date >= ?`,
+      [today, recentCutoff]
+    );
+    for (const inv of rows) {
+      // Don't spam: skip if we already notified about this invoice in the last 7 days.
+      const [existing] = await pool.execute(
+        "SELECT COUNT(*) AS cnt FROM notifications WHERE link = ? AND created_at > ?",
+        [`/invoices:${inv.id}`, addDays(today, -7)]
+      );
+      if (existing[0].cnt > 0) continue;
+
+      await pool.execute(
+        "INSERT INTO notifications (id, user_id, type, message, link, is_read) VALUES (?, ?, ?, ?, ?, FALSE)",
+        [
+          crypto.randomUUID(),
+          inv.user_id,
+          "invoice_overdue",
+          `Invoice ${inv.number} to ${inv.client} was due on ${inv.due_date} and is still unpaid.`,
+          `/invoices:${inv.id}`,
+        ]
+      );
+    }
+  } catch (err) {
+    console.error("checkOverdueInvoices failed:", err.message);
+  }
+}
+
 initSchema()
   .then(() => {
     app.listen(PORT, () => console.log(`Bahi backend listening on :${PORT}`));
+    // Run once right after schema init (so invoices generated while the server
+    // was down catch up), then every hour while the process is alive. Started
+    // only once initSchema() has resolved so the first run never races the
+    // CREATE TABLE / migration statements above.
+    backgroundJobs();
+    setInterval(backgroundJobs, 60 * 60 * 1000);
   })
   .catch((err) => {
     console.error("Failed to initialize TiDB schema:", err.message);
