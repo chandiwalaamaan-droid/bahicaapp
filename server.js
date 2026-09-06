@@ -7,6 +7,8 @@ import jwt from "jsonwebtoken";
 import { z } from "zod";
 import crypto from "crypto";
 import { OAuth2Client } from "google-auth-library";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import { CURRENT_TAX_RULES, taxRulesSummaryForPrompt } from "./taxRules.js";
 
 const app = express();
 
@@ -30,6 +32,41 @@ app.use(
   })
 );
 app.use(express.json({ limit: "1mb" }));
+
+// ---------- Rate limiting ----------
+// Previously there was none: /auth/*, /forgot-password, and the AI endpoints
+// could be hammered without limit — a brute-force vector on login, and a
+// straightforward way to run up the AI provider bill via /api/chat. These are
+// intentionally strict; a real user hitting the limit is a rare edge case,
+// while an unthrottled endpoint is an open invitation.
+//
+// authLimiter is the SAME instance reused across register/login/google/
+// forgot-password/reset-password, so its 10-per-15-min counter is a single
+// shared budget per IP across all five routes, not 10 per route. That's
+// deliberate — it stops someone dodging a per-route limit by spreading
+// attempts across the different auth endpoints — but it does mean a burst of
+// registrations from one IP can eat into that IP's login budget too. If that
+// ever proves too aggressive in practice, give login its own separate
+// rateLimit() instance instead of splitting hairs on the shared one.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts from this device. Please wait a few minutes and try again." },
+});
+
+// Keyed by user id (set by requireAuth, which always runs before this on
+// /api/chat routes) rather than IP, so it throttles per-account instead of
+// per-network — important since offices/campuses share IPs.
+const chatLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req, res) => req.userId || ipKeyGenerator(req.ip),
+  message: { error: "You've reached the hourly limit for AI Advisor messages. Please try again later." },
+});
 
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -230,6 +267,12 @@ async function initSchema() {
     // column and its unique index are added separately below.
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255)",
     "ALTER TABLE users MODIFY COLUMN password_hash VARCHAR(255) NULL",
+    // Bumped on password reset so previously issued JWTs stop working — see
+    // requireAuth() below. Without this, resetting a password (e.g. because
+    // you suspected your account was compromised) didn't invalidate any
+    // token an attacker already had; it would keep working until its 30-day
+    // expiry regardless.
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INT NOT NULL DEFAULT 0",
   ];
   for (const sql of migrations) {
     try {
@@ -257,16 +300,31 @@ async function initSchema() {
 }
 
 // ---------- Auth helpers ----------
-function signToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: "30d" });
+// tokenVersion is embedded in the JWT and cross-checked against the DB on
+// every authenticated request (see requireAuth). Bumping users.token_version
+// — currently only done on password reset — instantly invalidates every
+// token issued before that point, even though JWTs are otherwise stateless
+// and would normally stay valid until their 30-day expiry.
+function signToken(user, tokenVersion = 0) {
+  return jwt.sign({ sub: user.id, email: user.email, tv: tokenVersion }, JWT_SECRET, { expiresIn: "30d" });
 }
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Missing or invalid Authorization header" });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
+    // This adds one indexed primary-key lookup to every authenticated
+    // request. That's a deliberate trade-off for being able to revoke
+    // tokens at all with a stateless JWT scheme — at this app's scale it's
+    // cheap; if it ever isn't, cache token_version per user for a few
+    // seconds instead of re-checking on every single request.
+    const [rows] = await pool.execute("SELECT token_version FROM users WHERE id = ?", [payload.sub]);
+    const currentVersion = rows[0]?.token_version ?? 0;
+    if (!rows[0] || (payload.tv ?? 0) !== currentVersion) {
+      return res.status(401).json({ error: "Invalid or expired token" });
+    }
     req.userId = payload.sub;
     next();
   } catch {
@@ -424,7 +482,7 @@ async function sendResetEmail(toEmail, resetLink) {
 }
 
 // ---------- Auth routes ----------
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const body = validate(authSchema, req.body, res);
   if (!body) return;
   try {
@@ -438,14 +496,14 @@ app.post("/api/auth/register", async (req, res) => {
       [id, body.email, password_hash, body.name || null]
     );
     const user = { id, email: body.email, name: body.name || null };
-    res.json({ token: signToken(user), user });
+    res.json({ token: signToken(user, 0), user });
   } catch (err) {
     console.error("POST /api/auth/register failed:", err.message);
     res.status(500).json({ error: "Could not create account" });
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const body = validate(authSchema.pick({ email: true, password: true }), req.body, res);
   if (!body) return;
   try {
@@ -459,14 +517,14 @@ app.post("/api/auth/login", async (req, res) => {
     const ok = await bcrypt.compare(body.password, row.password_hash);
     if (!ok) return res.status(401).json({ error: "Invalid email or password" });
     const user = { id: row.id, email: row.email, name: row.name };
-    res.json({ token: signToken(user), user });
+    res.json({ token: signToken(user, row.token_version ?? 0), user });
   } catch (err) {
     console.error("POST /api/auth/login failed:", err.message);
     res.status(500).json({ error: "Login failed" });
   }
 });
 
-app.post("/api/auth/google", async (req, res) => {
+app.post("/api/auth/google", authLimiter, async (req, res) => {
   if (!googleClient) return res.status(503).json({ error: "Google sign-in is not configured on this server" });
   const body = validate(googleAuthSchema, req.body, res);
   if (!body) return;
@@ -496,19 +554,19 @@ app.post("/api/auth/google", async (req, res) => {
           "INSERT INTO users (id, email, password_hash, name, google_id) VALUES (?, ?, NULL, ?, ?)",
           [id, email, name, googleId]
         );
-        row = { id, email, name };
+        row = { id, email, name, token_version: 0 };
       }
     }
 
     const user = { id: row.id, email: row.email, name: row.name };
-    res.json({ token: signToken(user), user });
+    res.json({ token: signToken(user, row.token_version ?? 0), user });
   } catch (err) {
     console.error("POST /api/auth/google failed:", err.message);
     res.status(401).json({ error: "Google sign-in failed. Please try again." });
   }
 });
 
-app.post("/api/auth/forgot-password", async (req, res) => {
+app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
   const body = validate(forgotPasswordSchema, req.body, res);
   if (!body) return;
   try {
@@ -539,7 +597,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
   }
 });
 
-app.post("/api/auth/reset-password", async (req, res) => {
+app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
   const body = validate(resetPasswordSchema, req.body, res);
   if (!body) return;
   try {
@@ -554,7 +612,14 @@ app.post("/api/auth/reset-password", async (req, res) => {
     }
 
     const password_hash = await bcrypt.hash(body.password, 10);
-    await pool.execute("UPDATE users SET password_hash = ? WHERE id = ?", [password_hash, reset.user_id]);
+    // Bumping token_version here invalidates every JWT issued before this
+    // moment (checked in requireAuth), so a device that was logged in with
+    // the old password — or an attacker holding a stolen token — is signed
+    // out everywhere, not just locally on whichever device did the reset.
+    await pool.execute(
+      "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
+      [password_hash, reset.user_id]
+    );
     // Invalidate this and any other outstanding reset tokens for this user.
     await pool.execute("UPDATE password_resets SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL", [
       reset.user_id,
@@ -575,6 +640,14 @@ app.get("/api/auth/me", requireAuth, async (req, res) => {
     console.error("GET /api/auth/me failed:", err.message);
     res.status(500).json({ error: "Database error" });
   }
+});
+
+// Public — lets any client (including a future single-origin deployment of
+// the frontend) read the current tax rules from one place instead of
+// maintaining its own hardcoded copy. No auth needed: this is the same for
+// every user and contains no user data.
+app.get("/api/tax-rules", (req, res) => {
+  res.json(CURRENT_TAX_RULES);
 });
 
 // Everything below this line requires a valid token and is scoped to req.userId.
@@ -629,8 +702,14 @@ app.put("/api/business-profile", async (req, res) => {
 });
 
 // ---------- AI providers ----------
+// The tax-year text below used to be typed directly into this string as a
+// fixed FY/AY and slab list. That's exactly the kind of thing that goes
+// stale silently — the app would keep confidently quoting last year's rules
+// forever unless someone remembered to edit this string by hand. It's now
+// generated from taxRules.js, so bumping the assessment year in one place
+// updates the calculator, the Dashboard, and what the AI says.
 const SYSTEM_PROMPT_BASE =
-  "You are the AI Advisor inside 'Bahi', a personal accounting web app for Indian users (accessed at whatever URL the user visits it at — you don't know a fixed domain, so never invent one like 'bahi.in'). The app has exactly these sections, shown as tabs in the sidebar: Dashboard (income/expense/GST summary), Transactions (log income and expenses by category, with quick-add and auto-categorize from notes), Invoices (create GST invoices, mark paid/unpaid, issue credit/debit notes, and set up recurring templates that auto-generate on a schedule), Reports (profit and loss, cash flow, GST summary, and trend charts), Tax Calculator (income tax estimate) (income tax estimate), GST Calculator, AI Advisor (this chat), and Business Profile (name, GSTIN, PAN, address). The app also sends in-app notifications for due-date reminders and when recurring invoices auto-generate. There is no separate login domain, no 'magic link' sign-in, no Chart of Accounts. Do not describe features that aren't in this list, even if they sound plausible for an accounting app. If asked how to do something in the app, only describe these real tabs and actions. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (FY 2025-26: new regime default, slabs 0-4L nil/4-8L 5%/8-12L 10%/12-16L 15%/16-20L 20%/20-24L 25%/>24L 30%, 87A rebate up to 12L taxable income; old regime slabs 0-2.5L nil/2.5-5L 5%/5-10L 20%/>10L 30%). Be direct and confident, like a sharp advisor who knows the numbers — don't hedge on routine questions. Show your math in short form (e.g. \"₹8L × 10% = ₹80,000\") so the person can follow and trust the figure, not just take it on faith. You are an AI assistant, not a licensed Chartered Accountant; only say so explicitly when it actually matters — filings, large or unusual transactions, notices from the tax department, or anything the person could get penalized for — and even then keep it to one short line recommending they confirm with a qualified CA, not a disclaimer on every message. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.";
+  `You are the AI Advisor inside 'Bahi', a personal accounting web app for Indian users (accessed at whatever URL the user visits it at — you don't know a fixed domain, so never invent one like 'bahi.in'). The app has exactly these sections, shown as tabs in the sidebar: Dashboard (income/expense/GST summary), Transactions (log income and expenses by category, with quick-add and auto-categorize from notes), Invoices (create GST invoices, mark paid/unpaid, issue credit/debit notes, and set up recurring templates that auto-generate on a schedule), Reports (profit and loss, cash flow, GST summary, and trend charts), Tax Calculator (income tax estimate) (income tax estimate), GST Calculator, AI Advisor (this chat), and Business Profile (name, GSTIN, PAN, address). The app also sends in-app notifications for due-date reminders and when recurring invoices auto-generate. There is no separate login domain, no 'magic link' sign-in, no Chart of Accounts. Do not describe features that aren't in this list, even if they sound plausible for an accounting app. If asked how to do something in the app, only describe these real tabs and actions. Help with bookkeeping, GST, income tax (India), invoicing, and general financial planning questions, using current Indian tax rules as you understand them (${taxRulesSummaryForPrompt()}). Be direct and confident, like a sharp advisor who knows the numbers — don't hedge on routine questions. Show your math in short form (e.g. "₹8L × 10% = ₹80,000") so the person can follow and trust the figure, not just take it on faith. You are an AI assistant, not a licensed Chartered Accountant; only say so explicitly when it actually matters — filings, large or unusual transactions, notices from the tax department, or anything the person could get penalized for — and even then keep it to one short line recommending they confirm with a qualified CA, not a disclaimer on every message. You may be given a snapshot of the user's own books below — use it to answer questions about their actual income, expenses, and invoices, but don't assume it's complete.`;
 
 const PROVIDER_TIMEOUT = 15000;
 
@@ -1356,7 +1435,7 @@ function parseChatIdParam(req, res) {
   return id;
 }
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", chatLimiter, async (req, res) => {
   const body = validate(chatSchema, req.body, res);
   if (!body) return;
 
@@ -1383,7 +1462,7 @@ app.post("/api/chat", async (req, res) => {
 
 // Edit one of your own past messages: updates its text, drops everything that
 // came after it (the conversation branches from here), and gets a fresh reply.
-app.post("/api/chat/:id/edit", async (req, res) => {
+app.post("/api/chat/:id/edit", chatLimiter, async (req, res) => {
   const id = parseChatIdParam(req, res);
   if (id === null) return;
   const body = validate(chatSchema, req.body, res);
@@ -1414,7 +1493,7 @@ app.post("/api/chat/:id/edit", async (req, res) => {
 
 // Regenerate one of the AI's past replies: drops it (and anything after it),
 // then asks the model again from the same point in the conversation.
-app.post("/api/chat/:id/regenerate", async (req, res) => {
+app.post("/api/chat/:id/regenerate", chatLimiter, async (req, res) => {
   const id = parseChatIdParam(req, res);
   if (id === null) return;
 
