@@ -650,6 +650,11 @@ app.get("/api/tax-rules", (req, res) => {
   res.json(CURRENT_TAX_RULES);
 });
 
+// Public health check — used by uptime/cron monitors. No auth needed.
+app.get("/api/health", (req, res) => {
+  res.status(200).json({ status: "ok", uptime: process.uptime() });
+});
+
 // Everything below this line requires a valid token and is scoped to req.userId.
 app.use("/api/transactions", requireAuth);
 app.use("/api/invoices", requireAuth);
